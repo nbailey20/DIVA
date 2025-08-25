@@ -27,7 +27,7 @@ Each **event** to monitor is defined in `user_logic.py` and consists of:
 - An **inject** function – generates the event in the target system.
 - A **detect** function – checks whether the event successfully occurred.
 - An optional **alert** function – notifies your monitoring/alerting system (e.g., SNS, PagerDuty, Slack).
-These 3 functions all accept the event name as input to differentiate between different events.
+These 3 functions all accept the event name as input to differentiate between various events.
 They can be as complicated as you like, or as simple as a single print statement.
 
 DIVA runs periodically (via a CloudWatch schedule), iterating through all expected events:
@@ -36,7 +36,7 @@ DIVA runs periodically (via a CloudWatch schedule), iterating through all expect
    - If detection fails → failures are tracked in state.
 2. **Injection next** (when needed):  
    - On the first failure, or on every run if configured, an injection is attempted.
-   - Multiple consecutive failures eventually trigger the **alert** function once max_failures is reached.
+   - Multiple consecutive failures trigger the **alert** function once max_failures is reached.
 3. **State persistence**:  
    - In monolithic mode → persisted to **S3** JSON object.
    - In distributed mode → persisted to **DynamoDB**.
@@ -71,30 +71,36 @@ DIVA runs periodically (via a CloudWatch schedule), iterating through all expect
 
 ## Example `user_logic.py`
 
-You must provide this file alongside the Lambda package.
+You must provide this file alongside as input to the Terraform module.
 
 ```python
 def get_events():
     return {
-        "sample_event": {
+        "test_event1": {
+            "detect": inject_sample,
             "inject": inject_sample,
+            "alert": alert_sample,
+            "max_failures": 3,  # allow 3 consecutive misses before alert
+            "inject_each_period": True  # default behavior: False, inject only on first failure
+        },
+        "test_event2": {
+            "role": "detect" ## only perform detection logic, no injection. Defaults to both
             "detect": detect_sample,
-            "alert": alert_sample,   # optional
-            "max_failures": 3,       # default: 1
-            "inject_each_period": False
-        }
+            "alert": alert,
+        },
+        ...
     }
-
-# Example inject function
-def inject_sample(event_name):
-    print(f"Injecting test data for {event_name}")
-    # e.g., write a test message into SQS, Kafka, Pub/Sub, etc.
 
 # Example detect function
 def detect_sample(event_name):
     print(f"Checking data arrival for {event_name}")
     # e.g., query the destination system
     return True  # return True if healthy, False if not
+
+# Example inject function
+def inject_sample(event_name):
+    print(f"Injecting test data for {event_name}")
+    # e.g., write a test message into SQS, Kafka, Pub/Sub, etc.
 
 # Example alert function
 def alert_sample(message):
@@ -117,10 +123,6 @@ You must attach the following permissions to the Lambda’s IAM role depending o
 Uses **S3** to persist state.
 - `s3:GetObject` (for the state file)
 - `s3:PutObject` (to update the state file)
-- If `var.kms_key_arn` is set:
-  - `kms:Decrypt`
-  - `kms:Encrypt`
-  - `kms:GenerateDataKey`
 
 ### Distributed Mode (`DIVA_MODE=distributed`)
 Uses **DynamoDB** to persist state.
@@ -129,16 +131,17 @@ Uses **DynamoDB** to persist state.
 - `dynamodb:UpdateItem`
 - `dynamodb:DeleteItem`
 - `dynamodb:DescribeTable`
-- If `var.kms_key_arn` is set:
-  - `kms:Decrypt`
-  - `kms:Encrypt`
-  - `kms:GenerateDataKey`
 
-### Optional (if Lambda runs inside a VPC)
-If you attach the Lambda to a VPC for private networking:
+### Optional
+If you specify a Lambda VPC via `var.lambda_vpc_config`:
 - `ec2:CreateNetworkInterface`
 - `ec2:DescribeNetworkInterfaces`
 - `ec2:DeleteNetworkInterface`
+
+If you specify a KMS CMEK via `var.kms_key_arn`:
+- `kms:Decrypt`
+- `kms:Encrypt`
+- `kms:GenerateDataKey`
 
 ---
 
