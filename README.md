@@ -77,7 +77,7 @@ You must provide this file alongside as input to the Terraform module.
 def get_events():
     return {
         "test_event1": {
-            "detect": inject_sample,
+            "detect": inject_sample, ## user_provided function names to invoke for detection/injection/alerting
             "inject": inject_sample,
             "alert": alert_sample,
             "max_failures": 3,  # allow 3 consecutive misses before alert
@@ -86,7 +86,7 @@ def get_events():
         "test_event2": {
             "role": "detect" ## only perform detection logic, no injection. Defaults to both
             "detect": detect_sample,
-            "alert": alert,
+            "alert": alert_sample,
         },
         ...
     }
