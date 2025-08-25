@@ -2,6 +2,7 @@
 
 DIVA (Detect->Inject->Verify->Alert) is an AWS Lambda-based monitoring engine that validates whether events can occur in a system.
 If you can write code to do something and also validate whether that thing happened, DIVA can periodically probe this functionality and detect issues.
+
 It works by first **detecting** whether expected events are already occurring in a system by executing your custom detection logic. 
 If the desired events are not detected, your custom **injection** logic is executed to **verify** the event can occur. 
 An **alert** is generated if the event is still not detected after injection.
