@@ -1,12 +1,13 @@
 import os
 import json
 import logging
-import importlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.exceptions import ClientError
+
+import event_logic  # user-defined event logic to be executed by DIVA
 
 
 # --------------------
@@ -22,7 +23,16 @@ LOG_LEVEL_STR = os.environ.get("DIVA_LOG_LEVEL", "INFO").upper()
 
 s3         = boto3.client("s3")
 dynamodb   = boto3.resource("dynamodb")
-user_logic = importlib.import_module("user_logic")
+
+DEFAULT_EVENT_STATE = {
+    "detection_failures": 0,
+    "injected": False,
+    "last_injection_ts": None,
+    "first_detection_failure_ts": None,
+    "last_detection_failure_ts": None,
+    "alerted": False,
+}
+
 
 # --------------------
 # LOGGING
@@ -37,41 +47,68 @@ def setup_logging():
 # --------------------
 # STATE BACKENDS
 # --------------------
-def get_state():
+def load_state(event_id: str):
     if DIVA_MODE == "monolithic":
         try:
-            resp = s3.get_object(Bucket=STATE_BUCKET, Key=STATE_KEY)
-            return json.loads(resp["Body"].read())
+            obj = s3.get_object(Bucket=STATE_BUCKET, Key=STATE_KEY)
+            return json.loads(obj["Body"].read().decode("utf-8"))
         except s3.exceptions.NoSuchKey:
             return {}
-        except Exception:
-            logging.error("Error reading DIVA state file from S3", exc_info=True)
-            return {}
-    else:  # distributed → DynamoDB
+    else:
         table = dynamodb.Table(DDB_TABLE)
         try:
-            resp = table.get_item(Key={"state_id": "diva"})
-            return resp.get("Item", {}).get("state", {})
+            resp = table.get_item(Key={"event_id": event_id})
+            logging.debug("DynamoDB get_item response: %s", str(resp))
+            return resp.get("Item", {})
         except ClientError:
             logging.error("Error reading DIVA state from DynamoDB", exc_info=True)
             return {}
 
-def save_state(data):
+def save_state(event_id: str, state: dict):
+    ## merge with defaults to ensure all fields exist
+    ## values from 'state' take precedence
+    event_state = {**DEFAULT_EVENT_STATE, **state}
+
     if DIVA_MODE == "monolithic":
+        # dump the whole state blob as a single object in S3
         try:
             s3.put_object(
                 Bucket=STATE_BUCKET,
                 Key=STATE_KEY,
-                Body=json.dumps(data).encode("utf-8")
+                Body=json.dumps(state).encode("utf-8")
             )
         except Exception:
             logging.error("Error writing DIVA state to S3", exc_info=True)
-    else:  # distributed → DynamoDB
+    # distributed → DynamoDB
+    else:
         table = dynamodb.Table(DDB_TABLE)
         try:
-            table.put_item(Item={"state_id": "diva", "state": data})
+            table.put_item(
+                Item={
+                    "event_id": event_id,
+                    **event_state
+                }
+            )
         except ClientError:
             logging.error("Error writing DIVA state to DynamoDB", exc_info=True)
+
+
+def _load_event_state(event_name: str, full_state: dict | None = None) -> dict:
+    """Load state for a single event, backend-agnostic."""
+    if DIVA_MODE == "monolithic":
+        return full_state.get(event_name, DEFAULT_EVENT_STATE.copy())
+    else:  # distributed → DynamoDB
+        state = load_state(event_name)
+        return {**DEFAULT_EVENT_STATE, **state}
+
+
+def _save_event_state(event_name: str, event_state: dict, full_state: dict | None = None):
+    """Save state for a single event, backend-agnostic."""
+    if DIVA_MODE == "monolithic":
+        full_state[event_name] = event_state
+    else:  # distributed → DynamoDB
+        save_state(event_name, event_state)
+
 
 # --------------------
 # ALERTING
@@ -91,49 +128,75 @@ def process_detection(event_name, funcs, event_state):
     results = {}
 
     if funcs["detect"](event_name):
+        # Reset fields in state on successful detection
+        event_state["detection_failures"] = 0
+        event_state["first_detection_failure_ts"] = None
+        event_state["last_detection_failure_ts"] = None
+        event_state["alerted"] = False
+        event_state["injected"] = False 
+        event_state["last_injection_ts"] = None
+
         results[event_name] = "ok"
         return event_state, results
 
     ## if not detected, record failure timestamps
-    event_state["failures"] += 1
-    if event_state["first_failure_ts"] is None:
-        event_state["first_failure_ts"] = now
-    event_state["last_failure_ts"] = now
+    event_state["detection_failures"] += 1
+    if event_state["first_detection_failure_ts"] is None:
+        event_state["first_detection_failure_ts"] = now
+    event_state["last_detection_failure_ts"] = now
 
     ## if failures exceed threshold, send alert once
-    if event_state["failures"] >= funcs.get("max_failures", 1) and not event_state.get("alerted", False):
-        msg = f"DIVA Alert: event '{event_name}' failed {event_state['failures']} times (threshold={funcs.get('max_failures', 1)})"
+    if event_state["detection_failures"] >= funcs.get("max_failures", 1) and not event_state.get("alerted", False):
+        msg = f"DIVA Alert: event '{event_name}' failed {event_state['detection_failures']} times (threshold={funcs.get('max_failures', 1)})"
         send_alert(funcs, msg)
         event_state["alerted"] = True
 
-    results[event_name] = f"failures={event_state['failures']}"
+    results[event_name] = f"failures={event_state['detection_failures']}"
     return event_state, results
 
 # --------------------
 # INJECTION FUNCTION
 # --------------------
+def should_inject(event_state, funcs):
+    """Decide if injection should run based on detection failures + config."""
+    failures = event_state.get("detection_failures", 0)
+
+    if failures == 0:
+        return False, "skipped (healthy)"
+
+    if failures == 1 or funcs.get("inject_each_period", False):
+        return True, "injected"
+
+    return False, f"waiting ({failures}x)"
+
+
 def process_injection(event_name, funcs, event_state):
-    funcs["inject"](event_name)
-    event_state["injected"] = True
-    event_state["last_injected_ts"] = int(time.time())
-    results = {event_name: "injected"}
+    results = {}
+    now = int(time.time())
+
+    do_inject, status = should_inject(event_state, funcs)
+    if do_inject:
+        funcs["inject"](event_name)
+        event_state["injected"] = True
+        event_state["last_injection_ts"] = now
+
+    results[event_name] = status
     return event_state, results
 
 # --------------------
 # MONOLITHIC: DETECT + INJECT
 # --------------------
 def process_detection_and_injection(event_name, funcs, event_state):
-    # Call detection
+    # Run detection
     event_state, results = process_detection(event_name, funcs, event_state)
 
-    # If detection failed, optionally inject
-    if results[event_name].startswith("failures"):
-        if event_state["failures"] == 1 or funcs.get("inject_each_period", False):
-            event_state, inject_results = process_injection(event_name, funcs, event_state)
-            results.update(inject_results)
-        else:
-            # just waiting
-            results[event_name] = f"waiting ({event_state['failures']}x)"
+    # Decide if we should inject (only if detection failed)
+    do_inject, status = should_inject(event_state, funcs)
+    if do_inject:
+        event_state, inject_results = process_injection(event_name, funcs, event_state)
+        results.update(inject_results)
+    else:
+        results[event_name] = status
 
     return event_state, results
 
@@ -142,103 +205,101 @@ def process_detection_and_injection(event_name, funcs, event_state):
 # PROCESS SINGLE event
 # --------------------
 def process_event(event_name, funcs, event_state):
-    now = int(time.time())
-    results = {}
-
-    # initialize state fields
-    event_state.setdefault("failures", 0)
-    event_state.setdefault("injected", False)
-    event_state.setdefault("last_injected_ts", None)
-    event_state.setdefault("first_failure_ts", None)
-    event_state.setdefault("last_failure_ts", None)
-    event_state.setdefault("alerted", False)
-
-    max_failures = funcs.get("max_failures", 1)
     role = funcs.get("role", "both")  # "both", "detect", "inject"
 
     try:
-        # Skip events that don't match role in distributed mode
         if DIVA_MODE == "distributed":
             if role == "detect":
-                return event_name, process_detection(event_name, funcs, event_state)
+                return process_detection(event_name, funcs, event_state)
             elif role == "inject":
-                return event_name, process_injection(event_name, funcs, event_state)
+                return process_injection(event_name, funcs, event_state)
             else:
                 logging.debug("Skipping event '%s' in distributed mode", event_name)
-                return event_name, event_state, {event_name: "skipped"}
+                return event_state, {event_name: "skipped"}
 
-        # Monolithic mode: call detection then injection
-        return event_name, process_detection_and_injection(event_name, funcs, event_state)
+        # Monolithic mode: detection + injection
+        return process_detection_and_injection(event_name, funcs, event_state)
 
     except Exception as e:
         msg = f"DIVA Exception in event '{event_name}': {e}"
         send_alert(funcs, msg)
-        results[event_name] = "error"
-        return event_name, event_state, results
+        return event_state, {event_name: "error"}
 
 
 # --------------------
 # SERIAL event PROCESSING
 # --------------------
-def process_events_serial(events, state):
+def process_events_serial(events: dict, full_state: dict | None = None):
     results = {}
-    new_state = {}
 
     for event_name, funcs in events.items():
-        event_state, event_result = process_event(event_name, funcs, state.get(event_name, {}))
-        if event_state is not None:
-            new_state[event_name] = event_state
+        event_state = _load_event_state(event_name, full_state)
+        _, event_result = process_event(event_name, funcs, event_state)
+        _save_event_state(event_name, event_state, full_state)
         results.update(event_result)
 
-    return results, new_state
+    return results, full_state
 
 # --------------------
 # PARALLEL event PROCESSING
 # --------------------
-def process_events_parallel(events, state):
+def process_events_parallel(events: dict, full_state: dict | None = None):
     results = {}
-    new_state = {}
+
+    def _process_single(event_name: str, funcs: dict):
+        event_state = _load_event_state(event_name, full_state)
+        event_state, event_result = process_event(event_name, funcs, event_state)
+        _save_event_state(event_name, event_state, full_state)
+        return event_result
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_event, event_name, funcs, state.get(event_name, {})): event_name
-            for event_name, funcs in events.items()
-        }
+        futures = {executor.submit(_process_single, name, funcs): name for name, funcs in events.items()}
 
         for fut in as_completed(futures):
-            event_name, event_state, event_result = fut.result()
-            if event_state is not None:
-                new_state[event_name] = event_state
-            results.update(event_result)
+            try:
+                logging.debug("Completed event '%s'", fut.result())
+                results.update(fut.result())
+            except Exception as e:
+                logging.error("Error processing event '%s': %s", futures[fut], e, exc_info=True)
 
-    return results, new_state
+    return results, full_state
 
 
 # --------------------
 # Main HANDLER
 # --------------------
-def lambda_handler(event, context):
+def lambda_handler(_, __):
     setup_logging()
-
     logging.debug("Starting DIVA Lambda")
-    logging.debug("About to get state from S3")
-    state = get_state()
-    logging.debug("Retrieved state %s", str(state))
-    logging.debug("About to get events from user logic")
-    events = user_logic.get_events()
+
+    events = event_logic.get_events()
     logging.debug("Retrieved events %s", str(events))
+
     results = {}
 
-    if PARALLELIZE:
-        logging.debug("Parallelizing events")
-        results, new_state = process_events_parallel(events, state)
-    else:
-        logging.debug("Serializing events")
-        results, new_state = process_events_serial(events, state)
+    if DIVA_MODE == "monolithic":
+        # load the whole state once for S3
+        logging.debug("Loading full state from S3")
+        state = load_state("*")  # returns dict of all events
+
+        if PARALLELIZE:
+            logging.debug("Parallelizing events")
+            results, new_state = process_events_parallel(events, state)
+        else:
+            logging.debug("Serializing events")
+            results, new_state = process_events_serial(events, state)
+
+        logging.debug("Saving full state back to S3")
+        save_state(None, new_state)  # event_id=None means full blob
+        logging.debug("Saved state")
+
+    else:  # distributed → DynamoDB per-event rows
+        if PARALLELIZE:
+            logging.debug("Parallelizing events for distributed mode")
+            results, _ = process_events_parallel(events)
+        else:
+            logging.debug("Serializing events for distributed mode")
+            results, _ = process_events_serial(events)
 
     logging.debug("Results %s", str(results))
-    logging.debug("New state %s", str(new_state))
-    logging.debug("About to save state to S3")
-    save_state(new_state)
-    logging.debug("Saved state")
     return results

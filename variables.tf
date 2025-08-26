@@ -21,7 +21,7 @@ variable "schedule_expression" {
   default     = "rate(5 minutes)"
 }
 
-variable "user_logic_path" {
+variable "event_logic_path" {
   description = "Path to the user_logic.py file for this module invocation"
   type        = string
 }
@@ -71,5 +71,15 @@ variable "lambda_vpc_config" {
     security_group_ids = list(string)
   })
   description = "Optional VPC configuration for Lambda"
+  default     = null
+}
+
+variable "dynamodb_table_name" {
+  description = <<EOT
+Optionally provide an existing DynamoDB table name for DIVA state storage.
+This is used to connect multiple DIVA Lambda instances in distributed mode.
+If null and diva_mode=distributed, the module will create its own table.
+EOT
+  type        = string
   default     = null
 }

@@ -13,7 +13,7 @@ data "archive_file" "diva_lambda" {
   }
 
   source {
-    content  = file(var.user_logic_path)
-    filename = "user_logic.py"
+    content  = file(var.event_logic_path)
+    filename = "event_logic.py"
   }
 }

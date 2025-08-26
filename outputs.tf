@@ -15,7 +15,7 @@ output "state_bucket_name" {
 
 output "dynamodb_table_name" {
   description = "Name of the DynamoDB state table (distributed mode only)"
-  value       = var.diva_mode == "distributed" ? aws_dynamodb_table.diva_state[0].name : null
+  value       = local.state_table_name
 }
 
 output "eventbridge_rule_name" {
