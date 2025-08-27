@@ -24,14 +24,24 @@ LOG_LEVEL_STR = os.environ.get("DIVA_LOG_LEVEL", "INFO").upper()
 s3         = boto3.client("s3")
 dynamodb   = boto3.resource("dynamodb")
 
+
+#--------------------
+# DEFAULTS
+#--------------------
 DEFAULT_EVENT_STATE = {
-    "detection_failures": 0,
-    "injected": False,
-    "last_injection_ts": None,
-    "first_detection_failure_ts": None,
-    "last_detection_failure_ts": None,
-    "alerted": False,
+    "detection_failures": 0, # consecutive failed detections
+    "injection_failures": 0, # consecutive failed injections
+    "injected": False, # whether the event has been successfully injected
+    "alerted": False, # whether an alert has been generated for the event
+    "cooldown_counter": 0, # counts successful detections during cooldown period after alert
 }
+
+DEFAULT_MAX_FAILED_DETECTIONS = 3
+DEFAULT_MAX_FAILED_INJECTIONS = 1
+DEFAULT_INJECT_EACH_PERIOD    = False
+DEFAULT_RESET_POLICY          = "fast" # "fast", "cooldown"
+DEFAULT_COOLDOWN_THRESHOLD    = 3
+DEFAULT_DIVA_ROLE             = "both"  # "both", "detect", "inject"
 
 
 # --------------------
@@ -51,7 +61,9 @@ def load_state(event_id: str):
     if DIVA_MODE == "monolithic":
         try:
             obj = s3.get_object(Bucket=STATE_BUCKET, Key=STATE_KEY)
-            return json.loads(obj["Body"].read().decode("utf-8"))
+            state = obj["Body"].read().decode("utf-8")
+            logging.debug("Loaded state from S3: %s", state)
+            return json.loads(state)
         except s3.exceptions.NoSuchKey:
             return {}
     else:
@@ -110,8 +122,30 @@ def _save_event_state(event_name: str, event_state: dict, full_state: dict | Non
         save_state(event_name, event_state)
 
 
+def _reset_event_state(event_state, reset_policy: str, cooldown_threshold: int):
+    """
+    Reset or update event state depending on reset policy after a successful detection.
+
+    Args:
+        event_state (dict): Current state of the event.
+        reset_policy (str): 'fast' to immediately reset, 'cooldown' to reset after consecutive successful detections.
+        cooldown_threshold (int): Number of consecutive successful detections before reset in 'cooldown' mode.
+
+    Returns:
+        dict: Updated event state.
+    """
+    if reset_policy == "fast":
+        return DEFAULT_EVENT_STATE.copy()
+    elif reset_policy == "cooldown":
+        event_state["cooldown_counter"] = event_state.get("cooldown_counter", 0) + 1
+        if event_state["cooldown_counter"] >= cooldown_threshold:
+            return DEFAULT_EVENT_STATE.copy()
+
+    return event_state
+
+
 # --------------------
-# ALERTING
+# ALERTING FUNCTION
 # --------------------
 def send_alert(funcs, message):
     if "alert" in funcs and callable(funcs["alert"]):
@@ -124,35 +158,37 @@ def send_alert(funcs, message):
 # DETECTION FUNCTION
 # --------------------
 def process_detection(event_name, funcs, event_state):
-    now = int(time.time())
+    """
+    Perform detection logic and update state.
+    Handles max_failed_detections and reset policy after successful detection.
+    """
     results = {}
 
-    if funcs["detect"](event_name):
-        # Reset fields in state on successful detection
-        event_state["detection_failures"] = 0
-        event_state["first_detection_failure_ts"] = None
-        event_state["last_detection_failure_ts"] = None
-        event_state["alerted"] = False
-        event_state["injected"] = False 
-        event_state["last_injection_ts"] = None
+    max_failed_detections = funcs.get("max_failed_detections", DEFAULT_MAX_FAILED_DETECTIONS)
+    reset_policy = funcs.get("reset_policy", DEFAULT_RESET_POLICY)
+    cooldown_threshold = funcs.get("cooldown_success_threshold", DEFAULT_COOLDOWN_THRESHOLD)
 
+    # Run user detection
+    detected = funcs["detect"](event_name)
+    
+    if detected:
+        # Successful detection → handle reset
+        event_state = _reset_event_state(event_state, reset_policy, cooldown_threshold)
         results[event_name] = "ok"
         return event_state, results
 
-    ## if not detected, record failure timestamps
+    # Detection failed → increment counter
     event_state["detection_failures"] += 1
-    if event_state["first_detection_failure_ts"] is None:
-        event_state["first_detection_failure_ts"] = now
-    event_state["last_detection_failure_ts"] = now
 
-    ## if failures exceed threshold, send alert once
-    if event_state["detection_failures"] >= funcs.get("max_failures", 1) and not event_state.get("alerted", False):
-        msg = f"DIVA Alert: event '{event_name}' failed {event_state['detection_failures']} times (threshold={funcs.get('max_failures', 1)})"
+    # Alert if threshold exceeded
+    if event_state["detection_failures"] >= max_failed_detections and not event_state.get("alerted", False):
+        msg = f"DIVA Alert: event '{event_name}' failed {event_state['detection_failures']} times (threshold={max_failed_detections})"
         send_alert(funcs, msg)
         event_state["alerted"] = True
 
     results[event_name] = f"failures={event_state['detection_failures']}"
     return event_state, results
+
 
 # --------------------
 # INJECTION FUNCTION
@@ -164,39 +200,53 @@ def should_inject(event_state, funcs):
     if failures == 0:
         return False, "skipped (healthy)"
 
-    if failures == 1 or funcs.get("inject_each_period", False):
+    if failures == 1 or funcs.get("inject_each_period", DEFAULT_INJECT_EACH_PERIOD):
         return True, "injected"
 
     return False, f"waiting ({failures}x)"
 
 
 def process_injection(event_name, funcs, event_state):
+    """
+    Process injection for a single event.
+
+    Assumes funcs["inject"](event_name) returns True/False for success.
+    Tracks injection failures and raises alert if max_failed_injections exceeded.
+    """
     results = {}
-    now = int(time.time())
 
     do_inject, status = should_inject(event_state, funcs)
     if do_inject:
-        funcs["inject"](event_name)
-        event_state["injected"] = True
-        event_state["last_injection_ts"] = now
+        success = funcs["inject"](event_name)
+        event_state["injected"] = success
+
+        if not success:
+            event_state["injection_failures"] = event_state.get("injection_failures", 0) + 1
+            status = f"failed_injection ({event_state['injection_failures']}x)"
 
     results[event_name] = status
     return event_state, results
 
 # --------------------
-# MONOLITHIC: DETECT + INJECT
+# MONOLITHIC: DETECT + Conditional INJECT
 # --------------------
 def process_detection_and_injection(event_name, funcs, event_state):
-    # Run detection
-    event_state, results = process_detection(event_name, funcs, event_state)
+    """
+    Run detection and/or injection depending on event role.
+    Monolithic mode: allows conditional execution based on role.
+    """
+    role = funcs.get("role", DEFAULT_DIVA_ROLE)
+    results = {}
 
-    # Decide if we should inject (only if detection failed)
-    do_inject, status = should_inject(event_state, funcs)
-    if do_inject:
+    # Run detection if role includes "detect" or "both"
+    if role in ("detect", "both"):
+        event_state, detect_results = process_detection(event_name, funcs, event_state)
+        results.update(detect_results)
+
+    # Decide if we should inject if role includes "inject" or "both"
+    if role in ("inject", "both"):
         event_state, inject_results = process_injection(event_name, funcs, event_state)
         results.update(inject_results)
-    else:
-        results[event_name] = status
 
     return event_state, results
 
@@ -205,20 +255,48 @@ def process_detection_and_injection(event_name, funcs, event_state):
 # PROCESS SINGLE event
 # --------------------
 def process_event(event_name, funcs, event_state):
-    role = funcs.get("role", "both")  # "both", "detect", "inject"
+    """
+    Process a single event.
+
+    - Distributed mode: runs only the role-specified function (detect or inject).
+    - Monolithic mode: detection + conditional injection.
+    - Unified alert triggered if either failure counter exceeds its threshold.
+    """
+    role = funcs.get("role", DEFAULT_DIVA_ROLE)
 
     try:
+        # --- Distributed mode ---
         if DIVA_MODE == "distributed":
             if role == "detect":
-                return process_detection(event_name, funcs, event_state)
+                event_state, results = process_detection(event_name, funcs, event_state)
             elif role == "inject":
-                return process_injection(event_name, funcs, event_state)
+                event_state, results = process_injection(event_name, funcs, event_state)
             else:
                 logging.debug("Skipping event '%s' in distributed mode", event_name)
                 return event_state, {event_name: "skipped"}
 
-        # Monolithic mode: detection + injection
-        return process_detection_and_injection(event_name, funcs, event_state)
+        # --- Monolithic mode ---
+        else:
+            event_state, results = process_detection_and_injection(event_name, funcs, event_state)
+
+        # --- Unified alerting ---
+        max_failed_detections = funcs.get("max_failed_detections", DEFAULT_MAX_FAILED_DETECTIONS)
+        max_failed_injections = funcs.get("max_failed_injections", DEFAULT_MAX_FAILED_INJECTIONS)
+
+        if (
+            event_state.get("detection_failures", 0) >= max_failed_detections or
+            event_state.get("injection_failures", 0) >= max_failed_injections
+        ):
+            if not event_state.get("alerted", False):
+                msg = (
+                    f"DIVA Alert: event '{event_name}' failures → "
+                    f"detection: {event_state.get('detection_failures', 0)}, "
+                    f"injection: {event_state.get('injection_failures', 0)}"
+                )
+                send_alert(funcs, msg)
+                event_state["alerted"] = True
+
+        return event_state, results
 
     except Exception as e:
         msg = f"DIVA Exception in event '{event_name}': {e}"

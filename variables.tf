@@ -74,6 +74,12 @@ variable "lambda_vpc_config" {
   default     = null
 }
 
+variable "s3_bucket_name" {
+  description = "Optionally provide an existing S3 bucket name for DIVA state storage. If null and diva_mode=monolithic, the module will create its own bucket."
+  type        = string
+  default     = null
+}
+
 variable "dynamodb_table_name" {
   description = <<EOT
 Optionally provide an existing DynamoDB table name for DIVA state storage.

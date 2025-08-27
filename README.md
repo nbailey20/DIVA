@@ -1,45 +1,65 @@
 # DIVA Lambda Engine
 
-DIVA (Detect->Inject->Verify->Alert) is an AWS Lambda-based monitoring engine that validates whether events can occur in a system.
-If you can write code to do something and also validate whether that thing happened, DIVA can periodically probe this functionality and detect issues.
+DIVA (Detect->Inject->Verify->Alert) is an AWS Lambda-based monitoring engine that validates whether **events** can occur in a system.  
+If you can write code to perform an action and verify its result, DIVA can periodically probe this functionality and detect issues.
 
-It works by first **detecting** whether expected events are already occurring in a system by executing your custom detection logic. 
-If the desired events are not detected, your custom **injection** logic is executed to **verify** the event can occur. 
-An **alert** is generated if the event is still not detected after injection.
+It works by first **detecting** whether expected events are already occurring in a system by executing your custom detection logic.  
+If the desired events are not detected, your custom **injection** logic is executed to **verify** the event can occur.  
+An **alert** is generated if the event still fails after injection.
 
-Because the injection and detection logic is 100% customizable with the only constraint being executability from a Lambda function, this engine can support a wide variety of applications.
+Because the detection and injection logic is 100% customizable (must be executable from Lambda), this engine can support a wide variety of use cases.
 
-The module supports two execution modes:
+---
+
+## Execution Modes
 
 - **Monolithic mode** (default):  
-  A single Lambda function runs both injection and detection logic. State is stored in **S3**.  
-  ✅ Used where injection and detection can be executed from the same system.
+  - Single Lambda runs detection and injection logic.  
+  - State is persisted in **S3**.  
+  - ✅ Suitable when detection and injection can run from the same environment.
 
 - **Distributed mode**:  
-  Separate Lambdas run injection and detection independently. State is stored in **DynamoDB**.  
-  ✅ Used for cross-device or cross-region events, where injection and detection happen on different systems or in a hub/spoke architecture.
+  - Separate Lambdas handle detection vs injection independently.  
+  - State is persisted in **DynamoDB**.  
+  - ✅ Suitable for cross-device or cross-region events where injection and detection occur on different systems.
 
 ---
 
 ## How It Works
 
-Each **event** to monitor is defined in `user_logic.py` and consists of:
-- An **inject** function – generates the event in the target system.
-- A **detect** function – checks whether the event successfully occurred.
-- An optional **alert** function – notifies your monitoring/alerting system (e.g., SNS, PagerDuty, Slack).
-These 3 functions all accept the event name as input to differentiate between various events.
-They can be as complicated as you like, or as simple as a single print statement.
+Each **event** to monitor is defined in `event_logic.py` and consists of:
 
-DIVA runs periodically (via a CloudWatch schedule), iterating through all expected events:
-1. **Detection first**:  
-   - If detection succeeds → event is marked healthy.
-   - If detection fails → failures are tracked in state.
-2. **Injection next** (when needed):  
-   - On the first failure, or on every run if configured, an injection is attempted.
-   - Multiple consecutive failures trigger the **alert** function once max_failures is reached.
-3. **State persistence**:  
-   - In monolithic mode → persisted to **S3** JSON object.
-   - In distributed mode → persisted to **DynamoDB**.
+- **detect** function – checks whether the event occurred. Returns `True` if healthy, `False` otherwise.  
+- **inject** function – triggers the event in the target system. Returns `True` if injection was successful, `False` otherwise.  
+- Optional **alert** function – invoked if an event fails detection or injection beyond allowed thresholds.  
+
+These functions receive the event name to differentiate multiple events.
+
+DIVA runs periodically (via CloudWatch schedule), iterating through all events:
+
+1. **Detection**  
+   - If detection succeeds → event is marked healthy.  
+   - If detection fails → failure count increments in state.
+
+2. **Injection**  
+   - Only performed if needed (on first failure or if configured to reinject each period).  
+   - Injection failures increment a separate counter.  
+
+3. **Alerting**  
+   - Triggered once max thresholds are reached:  
+     - `max_failed_detections` → alert for repeated detection failures  
+     - `max_failed_injections` → alert for repeated injection failures  
+
+4. **State persistence**  
+   - Monolithic mode → persisted to **S3** JSON object.  
+   - Distributed mode → persisted per-event to **DynamoDB**.  
+
+5. **Recovery / Reset**  
+   - If an event is successfully detected, state may reset according to `reset_policy`:  
+     - `"fast"` → reset failures and injection flags immediately  
+     - `"cooldown"` → increment a `cooldown_counter` each successful detection until a threshold is reached, then reset  
+
+> All other details of historical failures and injections are logged via Lambda in CloudWatch.
 
 ---
 
@@ -47,11 +67,11 @@ DIVA runs periodically (via a CloudWatch schedule), iterating through all expect
 
 | Variable           | Type     | Description                                                                 | Default        |
 |--------------------|----------|-----------------------------------------------------------------------------|----------------|
-| `diva_mode`        | string   | Engine mode: `"monolithic"` (S3 state, 1 Lambda) or `"distributed"` (DynamoDB state, 2 Lambdas). | `"monolithic"` |
-| `lambda_role_arn`  | string   | ARN of the IAM role to attach to the Lambda. Must already exist.            | n/a (required) |
-| `schedule`         | string   | CloudWatch EventBridge schedule expression for how often DIVA runs.         | `"rate(5m)"`   |
-| `vpc_config`       | object   | Optional. Provide `subnet_ids` and `security_group_ids` to attach Lambda to a VPC. Example:<br>`{ subnet_ids = ["subnet-123"], security_group_ids = ["sg-123"] }` | `null` |
-| `kms_key_arn`      | string   | Optional. ARN of KMS key to encrypt Lambda environment variables.           | `null`         |
+| `diva_mode`        | string   | `"monolithic"` (S3 state, single Lambda) or `"distributed"` (DynamoDB, separate Lambdas) | `"monolithic"` |
+| `lambda_role_arn`  | string   | ARN of existing IAM role for the Lambda                                      | n/a (required) |
+| `schedule`         | string   | CloudWatch EventBridge schedule expression for running DIVA                 | `"rate(5m)"`   |
+| `vpc_config`       | object   | Optional VPC config: `subnet_ids` and `security_group_ids`                  | `null`         |
+| `kms_key_arn`      | string   | Optional KMS key ARN to encrypt Lambda environment variables                | `null`         |
 
 ---
 
@@ -61,58 +81,52 @@ DIVA runs periodically (via a CloudWatch schedule), iterating through all expect
 |----------------------------|-------------|
 | `lambda_function_name`     | Name of the DIVA Lambda function. |
 | `lambda_function_arn`      | ARN of the DIVA Lambda function. |
-| `state_bucket_name`        | (Monolithic mode only) Name of the S3 bucket storing DIVA state. |
-| `dynamodb_table_name`      | (Distributed mode only) Name of the DynamoDB table storing DIVA state. |
-| `eventbridge_rule_name`    | Name of the EventBridge rule that triggers the Lambda. |
-| `eventbridge_rule_arn`     | ARN of the EventBridge rule that triggers the Lambda. |
-| `lambda_execution_role_arn`| ARN of the IAM role attached to the Lambda (provided externally). |
+| `state_bucket_name`        | (Monolithic mode only) S3 bucket storing DIVA state. |
+| `dynamodb_table_name`      | (Distributed mode only) DynamoDB table storing per-event state. |
+| `eventbridge_rule_name`    | Name of the EventBridge rule triggering the Lambda. |
+| `eventbridge_rule_arn`     | ARN of the EventBridge rule triggering the Lambda. |
+| `lambda_execution_role_arn`| ARN of the attached IAM role (provided externally). |
 
 ---
 
-## Example `user_logic.py`
-
-You must provide this file alongside as input to the Terraform module.
+## Example `event_logic.py`
 
 ```python
 def get_events():
     return {
         "test_event1": {
-            "detect": inject_sample, ## user_provided function names to invoke for detection/injection/alerting
+            "detect": detect_sample,
             "inject": inject_sample,
             "alert": alert_sample,
-            "max_failures": 3,  # allow 3 consecutive misses before alert
-            "inject_each_period": True  # default behavior: False, inject only on first failure
+            "max_failed_detections": 3,
+            "max_failed_injections": 2,
+            "inject_each_period": True,
+            "reset_policy": "cooldown",
+            "cooldown_success_threshold": 2,
         },
         "test_event2": {
-            "role": "detect" ## only perform detection logic, no injection. Defaults to both
+            "role": "detect",
             "detect": detect_sample,
             "alert": alert_sample,
         },
-        ...
     }
 
-# Example detect function
 def detect_sample(event_name):
-    print(f"Checking data arrival for {event_name}")
-    # e.g., query the destination system
-    return True  # return True if healthy, False if not
+    print(f"Checking event: {event_name}")
+    return True  # True if detected
 
-# Example inject function
 def inject_sample(event_name):
-    print(f"Injecting test data for {event_name}")
-    # e.g., write a test message into SQS, Kafka, Pub/Sub, etc.
+    print(f"Injecting event: {event_name}")
+    return True  # True if injection succeeded
 
-# Example alert function
 def alert_sample(message):
     print(f"ALERT: {message}")
-    # e.g., send to Slack, SNS, PagerDuty, etc.
 ```
 ---
 
 ## IAM Permissions
 
-This module **does not create IAM roles or policies**.  
-You must attach the following permissions to the Lambda’s IAM role depending on the chosen `DIVA_MODE`.
+This module **does not create IAM roles or policies**. Attach these permissions to the Lambda role:
 
 ### Common (all modes)
 - `logs:CreateLogGroup`
@@ -120,12 +134,10 @@ You must attach the following permissions to the Lambda’s IAM role depending o
 - `logs:PutLogEvents`
 
 ### Monolithic Mode (`DIVA_MODE=monolithic`)
-Uses **S3** to persist state.
-- `s3:GetObject` (for the state file)
-- `s3:PutObject` (to update the state file)
+- `s3:GetObject`
+- `s3:PutObject`
 
 ### Distributed Mode (`DIVA_MODE=distributed`)
-Uses **DynamoDB** to persist state.
 - `dynamodb:GetItem`
 - `dynamodb:PutItem`
 - `dynamodb:UpdateItem`
@@ -133,15 +145,14 @@ Uses **DynamoDB** to persist state.
 - `dynamodb:DescribeTable`
 
 ### Optional
-If you specify a Lambda VPC via `var.lambda_vpc_config`:
-- `ec2:CreateNetworkInterface`
-- `ec2:DescribeNetworkInterfaces`
-- `ec2:DeleteNetworkInterface`
-
-If you specify a KMS CMEK via `var.kms_key_arn`:
-- `kms:Decrypt`
-- `kms:Encrypt`
-- `kms:GenerateDataKey`
+- If attaching the Lambda to a VPC:
+  - `ec2:CreateNetworkInterface`
+  - `ec2:DescribeNetworkInterfaces`
+  - `ec2:DeleteNetworkInterface`  
+- If specifying a KMS CMEK via `kms_key_arn`:
+  - `kms:Decrypt`
+  - `kms:Encrypt`
+  - `kms:GenerateDataKey`
 
 ---
 

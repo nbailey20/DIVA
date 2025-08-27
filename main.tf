@@ -1,10 +1,15 @@
+resource "random_id" "s3_suffix" {
+  byte_length = 4
+}
+
+
 # ---------------------------
 # S3 for monolithic mode
 # ---------------------------
 resource "aws_s3_bucket" "diva_state" {
   count = var.diva_mode == "monolithic" ? 1 : 0
 
-  bucket = "diva-state-${var.region}-${data.aws_caller_identity.current.account_id}"
+  bucket = var.s3_bucket_name != null ? var.s3_bucket_name : "${var.lambda_name}-state-${random_id.s3_suffix.hex}"
 
   tags = {
     Name = "diva-state"
