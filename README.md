@@ -232,19 +232,18 @@ module "diva_monolithic" {
   event_logic_path = "./event_logic.py"
 
   lambda_role_arn    = aws_iam_role.diva_lambda.arn
-  lambda_log_level   = "DEBUG"  # verbose for troubleshooting
-  lambda_timeout_sec = 300
-  parallelize        = true
-  max_workers        = 8
-  
+  lambda_log_level   = "DEBUG"  # optional, verbose for troubleshooting
+  lambda_timeout_sec = 300      # optional
+  parallelize        = true     # optional, default true
+  max_workers        = 8        # optional, default 8 threads for parallelization
 
-  lambda_vpc_config = {
+  lambda_vpc_config = {         # optional
     subnet_ids         = ["subnet-123456"]
     security_group_ids = ["sg-123456"]
   }
 
-  kms_key_arn    = aws_kms_key.diva.arn
-  s3_bucket_name = "test-diva-bucket"
+  kms_key_arn    = aws_kms_key.diva.arn  # optional
+  s3_bucket_name = "test-diva-bucket"    # optional for monolithic mode, will use lambda name otherwise
 }
 ```
 
@@ -272,7 +271,7 @@ module "diva_distributed" {
   event_logic_path = "./event_logic.py"
   lambda_role_arn  = aws_iam_role.diva_lambda.arn
 
-  dynamodb_table_name = "test-diva-ddb-table"
+  dynamodb_table_name = "test-diva-ddb-table" ## existing DB table name to connect to for sharing state
 }
 ```
 
