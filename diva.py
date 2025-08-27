@@ -123,12 +123,17 @@ DEFAULT_EVENT_STATE = {
     "cooldown_counter": 0,     # Counts successful detections during cooldown period after alert
 }
 
+DEFAULT_DIVA_ROLE             = "both" # "both", "detect", "inject"
 DEFAULT_MAX_FAILED_DETECTIONS = 3
 DEFAULT_MAX_FAILED_INJECTIONS = 1
 DEFAULT_INJECT_EACH_PERIOD    = False
-DEFAULT_RESET_POLICY          = "fast"      # "fast" = reset immediately, "cooldown" = reset after N successes
-DEFAULT_COOLDOWN_THRESHOLD    = 3
-DEFAULT_DIVA_ROLE             = "both"      # "both", "detect", "inject"
+DEFAULT_COOLDOWN_THRESHOLD    = 3      # Number of consecutive successful detections before reset in "cooldown" reset mode
+DEFAULT_RESET = {
+    "mode": "fast",                    # "fast" = immediately reset, "cooldown" = reset after consecutive successes
+    "on_verify": True                  # whether to reset only after a successful detection following an injection
+}
+
+
 
 
 # --------------------
@@ -217,30 +222,35 @@ def _save_event_state(event_name: str, event_state: dict, full_state: dict | Non
         save_state(event_name, event_state)
 
 
-def _reset_event_state(event_state, reset_policy: str, cooldown_threshold: int):
+def _reset_event_state(event_state: dict, reset_config: dict, cooldown_threshold: int):
     """
-    Reset or update event state depending on reset policy after a successful detection.
+    Reset or update event state based on reset configuration after a successful detection.
 
     Args:
-        event_state (dict): Current state of the event.
-        reset_policy (str): "fast" = immediately reset all counters,
-                            "cooldown" = reset after N consecutive successes.
-        cooldown_threshold (int): Number of consecutive successful detections required in cooldown mode.
+        event_state: Current state of the event.
+        reset_config: Dict with keys:
+            - mode: "fast" or "cooldown"
+            - on_verify: bool, reset failures after a verified detection
+        cooldown_threshold: Number of consecutive successes before reset in "cooldown" mode.
 
     Returns:
         dict: Updated event state.
     """
-    if reset_policy == "fast":
-        if event_state.get("alerted"):
-            logging.info("Resetting event alert")
+    mode = reset_config.get("mode", "fast")
+    on_verify = reset_config.get("on_verify", True)
+
+    if not on_verify:
+        return event_state
+
+    if mode == "fast":
         return DEFAULT_EVENT_STATE.copy()
-    elif reset_policy == "cooldown":
-        # Only increment cooldown counter if the event was previously alerted
-        if event_state.get("alerted", False):
-            event_state["cooldown_counter"] = event_state.get("cooldown_counter", 0) + 1
-            if event_state["cooldown_counter"] >= cooldown_threshold:
-                return DEFAULT_EVENT_STATE.copy()
+    elif mode == "cooldown":
+        event_state["cooldown_counter"] = event_state.get("cooldown_counter", 0) + 1
+        if event_state["cooldown_counter"] >= cooldown_threshold:
+            return DEFAULT_EVENT_STATE.copy()
+
     return event_state
+
 
 
 # --------------------
@@ -262,13 +272,13 @@ def process_detection(event_name, funcs, event_state):
     Run detection logic for an event and update state.
 
     - Increments detection failure counter on failures.
-    - Resets counters on success, based on reset_policy.
+    - Resets counters on success depending on reset_policy and reset_on_verify.
     - Triggers alert when max_failed_detections is exceeded.
     """
     results = {}
 
     max_failed_detections = funcs.get("max_failed_detections", DEFAULT_MAX_FAILED_DETECTIONS)
-    reset_policy = funcs.get("reset_policy", DEFAULT_RESET_POLICY)
+    reset_config = funcs.get("reset", DEFAULT_RESET)
     cooldown_threshold = funcs.get("cooldown_success_threshold", DEFAULT_COOLDOWN_THRESHOLD)
 
     logging.info("Detecting event '%s'...", event_name)
@@ -288,20 +298,17 @@ def process_detection(event_name, funcs, event_state):
         # Reset state according to policy
         old_state = event_state.copy()
 
-        # Only track cooldown if event was alerted and using cooldown reset
-        in_cooldown = event_state.get("alerted", False) and reset_policy == "cooldown"
+        # Reset state if on_verify is True
+        if reset_config.get("on_verify", True):
+            event_state = _reset_event_state(event_state, reset_config, cooldown_threshold)
 
-        event_state = _reset_event_state(event_state, reset_policy, cooldown_threshold)
-
-        if reset_policy == "fast":
+        # Cooldown / fast reset logging
+        if reset_config.get("mode", "fast") == "fast" and reset_config.get("on_verify", True):
             logging.debug("Fast reset applied | before=%s | after=%s", old_state, event_state)
-        elif reset_policy == "cooldown" and in_cooldown:
+        elif reset_config.get("mode") == "cooldown" and event_state.get("alerted", False) and reset_config.get("on_verify", True):
             cc = event_state.get("cooldown_counter", 0)
             if cc < cooldown_threshold:
-                logging.info(
-                    "Event '%s' in cooldown (%d/%d)",
-                    event_name, cc, cooldown_threshold
-                )
+                logging.info("Event '%s' in cooldown (%d/%d)", event_name, cc, cooldown_threshold)
             else:
                 logging.info("Event '%s' cooldown complete → state fully reset", event_name)
             logging.debug("Cooldown reset applied | before=%s | after=%s", old_state, event_state)
