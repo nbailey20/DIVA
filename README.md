@@ -13,15 +13,18 @@ Because the detection and injection logic is 100% customizable (must be executab
 
 ## Execution Modes
 
-- **Monolithic mode** (default):  
-  - Single Lambda runs detection and injection logic.  
-  - State is persisted in **S3**.  
-  - ✅ Suitable when detection and injection can run from the same environment.
+1. Monolithic Mode (default):
+   - Runs detection and/or injection in sequence, determined by the event's `role`.
+   - Detection always executes first if `role` includes `"detect"` or `"both"`.
+   - Injection may run if `role` includes `"inject"` or `"both"` **and** detection failed (configurable via `inject_each_period`).
+   - Useful for single-process, "self-contained" environments.
+   - Logging will indicate if an event is skipped due to its role.
 
-- **Distributed mode**:  
-  - Separate Lambdas handle detection vs injection independently.  
-  - State is persisted in **DynamoDB**.  
-  - ✅ Suitable for cross-device or cross-region events where injection and detection occur on different systems.
+2. Distributed Mode:
+   - Each event is assigned a `role`: `"detect"` or `"inject"`.
+   - Only the matching function runs, depending on the event's role.
+   - Useful for scaling detection and injection across different workers.
+   - Unified alerting can still trigger if either failure counter exceeds thresholds.
 
 ---
 
@@ -63,6 +66,40 @@ DIVA runs periodically (via CloudWatch schedule), iterating through all events:
 
 ---
 
+## Event State
+Each event has a state object that tracks minimal but essential information:
+
+| Field                  | Description                                                                 |
+|------------------------|-----------------------------------------------------------------------------|
+| `detection_failures`    | Consecutive failed detections.                                              |
+| `injection_failures`    | Consecutive failed injections.                                              |
+| `injected`              | Whether the event has been successfully injected.                          |
+| `alerted`               | Whether an alert has been generated for this event.                        |
+| `cooldown_counter`      | Counts consecutive successful detections after an alert in "cooldown" mode.|
+
+- State is persisted to **S3** in monolithic mode and **DynamoDB** in distributed mode.
+- On a successful detection, the state may be reset according to `reset_policy`:
+  - `"fast"`: Immediately resets the state to defaults.
+  - `"cooldown"`: Increments `cooldown_counter` and resets only after `cooldown_success_threshold` consecutive successful detections.
+- Timestamps are no longer stored in state; CloudWatch logging provides a complete chronological record of detections and injections.
+
+---
+
+## Reset Policies
+
+`reset_policy` determines how the event state is updated after successful detection:
+
+| Policy    | Description                                                                                  |
+|-----------|----------------------------------------------------------------------------------------------|
+| `fast`    | Immediately resets the event state to default values.                                         |
+| `cooldown`| Increments `cooldown_counter` on each successful detection. State is reset only after the counter reaches `cooldown_success_threshold`. |
+
+- Default policy: `fast`.
+- `cooldown_success_threshold` (default: 3) specifies how many consecutive successful detections are required before state reset in cooldown mode.
+- Alerts and failure counters are cleared when state is reset.
+
+---
+
 ## Module Variables
 
 | Variable           | Type     | Description                                                                 | Default        |
@@ -72,6 +109,9 @@ DIVA runs periodically (via CloudWatch schedule), iterating through all events:
 | `schedule`         | string   | CloudWatch EventBridge schedule expression for running DIVA                 | `"rate(5m)"`   |
 | `vpc_config`       | object   | Optional VPC config: `subnet_ids` and `security_group_ids`                  | `null`         |
 | `kms_key_arn`      | string   | Optional KMS key ARN to encrypt Lambda environment variables                | `null`         |
+| `parallelize`  | bool   | Whether to process events in parallel.                                                       | `true`  |
+| `max_workers`  | int    | Maximum threads used when parallelizing event processing.                                     | `8`     |
+| `log_level`    | string | `"INFO"` or `"DEBUG"`. `INFO` = clean CloudWatch logs; `DEBUG` = verbose internal state.    | `"INFO"`|
 
 ---
 
@@ -91,36 +131,58 @@ DIVA runs periodically (via CloudWatch schedule), iterating through all events:
 
 ## Example `event_logic.py`
 
+You must provide this file alongside the Terraform module.
+
 ```python
 def get_events():
     return {
-        "test_event1": {
+        "event_1": {
             "detect": detect_sample,
             "inject": inject_sample,
             "alert": alert_sample,
-            "max_failed_detections": 3,
-            "max_failed_injections": 2,
-            "inject_each_period": True,
-            "reset_policy": "cooldown",
-            "cooldown_success_threshold": 2,
+            "role": "both",                 # perform detection + injection
+            "max_failed_detections": 3,     # alert after 3 failed detections
+            "max_failed_injections": 1,     # alert after 1 failed injection
+            "inject_each_period": True,     # inject on every period if failed
+            "reset_policy": "cooldown",     # cooldown reset after success
+            "cooldown_success_threshold": 2 # reset after 2 consecutive successful detections
         },
-        "test_event2": {
-            "role": "detect",
+        "event_2": {
+            "inject": inject_sample,
+            "alert": alert_sample,
+            "role": "inject",               # only run injection
+            "max_failed_injections": 2
+        },
+        "event_3": {
             "detect": detect_sample,
             "alert": alert_sample,
+            "role": "detect",               # only run detection
+            "max_failed_detections": 4
         },
     }
 
+# --------------------
+# Example detect function
+# --------------------
 def detect_sample(event_name):
-    print(f"Checking event: {event_name}")
-    return True  # True if detected
+    print(f"Checking event '{event_name}' in the target system")
+    # Return True if healthy, False if event is missing
+    return True
 
+# --------------------
+# Example inject function
+# --------------------
 def inject_sample(event_name):
-    print(f"Injecting event: {event_name}")
-    return True  # True if injection succeeded
+    print(f"Injecting event '{event_name}' into the target system")
+    # Return True if injection succeeded, False if failed
+    return True
 
+# --------------------
+# Example alert function
+# --------------------
 def alert_sample(message):
     print(f"ALERT: {message}")
+    # Integrate with Slack, SNS, PagerDuty, etc.
 ```
 ---
 
@@ -174,4 +236,24 @@ module "diva" {
   kms_key_arn = aws_kms_key.diva.arn
 }
 ```
+
+## Example Logs
+```text
+INFO  Getting events...  
+INFO  Retrieved 4 events  
+INFO  Detecting event 'event_1'...  
+INFO  Detection for event 'event_1' failed (1/3)  
+INFO  Injecting event 'event_1'...  
+INFO  Detection for event 'event_2' skipped due to role='inject'  
+INFO  Injecting event 'event_2'...  
+INFO  Detection for event 'event_3' succeeded  
+INFO  Event 'event_3' cooldown complete → state fully reset  
+INFO  Alerting for event 'event_1'  
+INFO  Event 'event_1' alerted  
+```
+Successful events, skipped detections, injections, cooldowns, and alerts are all clearly logged.  
+
+Debug logs provide full event state for troubleshooting.  
+
+
 # DIVA
