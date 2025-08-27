@@ -30,13 +30,14 @@ Because the detection and injection logic is 100% customizable (must be executab
 
 ## How It Works
 
-Each **event** to monitor is defined in `event_logic.py` and consists of:
+Each **event** to monitor is defined by you in `event_logic.py` and consists of:
 
 - **detect** function – checks whether the event occurred. Returns `True` if healthy, `False` otherwise.  
 - **inject** function – triggers the event in the target system. Returns `True` if injection was successful, `False` otherwise.  
 - Optional **alert** function – invoked if an event fails detection or injection beyond allowed thresholds.  
 
-These functions receive the event name to differentiate multiple events.
+These functions receive the event name as input to differentiate multiple events. They can be as simple as a single print statement,
+or as complicated as you like. The only limitation is that they must be executable within Lambda.
 
 DIVA runs periodically (via CloudWatch schedule), iterating through all events:
 
@@ -49,7 +50,7 @@ DIVA runs periodically (via CloudWatch schedule), iterating through all events:
    - Injection failures increment a separate counter.  
 
 3. **Alerting**  
-   - Triggered once max thresholds are reached:  
+   - Triggered once one or more max thresholds are reached:  
      - `max_failed_detections` → alert for repeated detection failures  
      - `max_failed_injections` → alert for repeated injection failures  
 
@@ -81,7 +82,7 @@ Each event has a state object that tracks minimal but essential information:
 - On a successful detection, the state may be reset according to `reset_policy`:
   - `"fast"`: Immediately resets the state to defaults.
   - `"cooldown"`: Increments `cooldown_counter` and resets only after `cooldown_success_threshold` consecutive successful detections.
-- Timestamps are no longer stored in state; CloudWatch logging provides a complete chronological record of detections and injections.
+- CloudWatch logging provides a complete chronological record of detections and injections.
 
 ---
 
@@ -220,22 +221,62 @@ This module **does not create IAM roles or policies**. Attach these permissions 
 
 ## Example Usage
 
+### Monolithic Mode (Default)
+
 ```hcl
-module "diva" {
+module "diva_monolithic" {
   source = "./diva"
 
-  lambda_role_arn = aws_iam_role.diva_lambda.arn
-  diva_mode       = "monolithic" # or "distributed"
-  schedule        = "rate(5 minutes)"
+  diva_mode        = "monolithic"
+  schedule         = "rate(5 minutes)"
+  event_logic_path = "./event_logic.py"
 
-  vpc_config = {
+  lambda_role_arn    = aws_iam_role.diva_lambda.arn
+  lambda_log_level   = "DEBUG"  # verbose for troubleshooting
+  lambda_timeout_sec = 300
+  parallelize        = true
+  max_workers        = 8
+  
+
+  lambda_vpc_config = {
     subnet_ids         = ["subnet-123456"]
     security_group_ids = ["sg-123456"]
   }
 
-  kms_key_arn = aws_kms_key.diva.arn
+  kms_key_arn    = aws_kms_key.diva.arn
+  s3_bucket_name = "test-diva-bucket"
 }
 ```
+
+### Distributed Mode with New DB for State
+
+```hcl
+module "diva_distributed" {
+  source = "./diva"
+
+  diva_mode           = "distributed"
+  schedule            = "rate(5 minutes)"
+  event_logic_path    = "./event_logic.py"
+  lambda_role_arn     = aws_iam_role.diva_lambda.arn
+}
+```
+
+### Distributed Mode Connecting to Existing DB
+
+```hcl
+module "diva_distributed" {
+  source = "./diva"
+
+  diva_mode        = "distributed"
+  schedule         = "rate(5 minutes)"
+  event_logic_path = "./event_logic.py"
+  lambda_role_arn  = aws_iam_role.diva_lambda.arn
+
+  dynamodb_table_name = "test-diva-ddb-table"
+}
+```
+
+---
 
 ## Example Logs
 ```text
