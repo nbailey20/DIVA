@@ -120,6 +120,8 @@ DEFAULT_EVENT_STATE = {
     "injection_failures": 0,   # Consecutive failed injections
     "injected": False,         # Whether the event has been successfully injected
     "alerted": False,          # Whether an alert has been generated for the event
+    "in_warmup": False,        # Whether the event is in warmup state
+    "warmup_counter": 0,       # Counts successful detections during initial warmup period
     "cooldown_counter": 0,     # Counts successful detections during cooldown period after alert
 }
 
@@ -127,12 +129,15 @@ DEFAULT_DIVA_ROLE             = "both" # "both", "detect", "inject"
 DEFAULT_MAX_FAILED_DETECTIONS = 3
 DEFAULT_MAX_FAILED_INJECTIONS = 1
 DEFAULT_INJECT_EACH_PERIOD    = False
-DEFAULT_COOLDOWN_THRESHOLD    = 3      # Number of consecutive successful detections before reset in "cooldown" reset mode
+DEFAULT_WARMUP = {
+    "enabled": False,                # Whether warmup is enabled
+    "success_threshold": 2           # Number of consecutive successful detections to exit warmup
+}
 DEFAULT_RESET = {
     "mode": "fast",                    # "fast" = immediately reset, "cooldown" = reset after consecutive successes
-    "on_verify": True                  # whether to reset only after a successful detection following an injection
+    "on_verify": True,                 # whether to reset only after a successful detection following an injection
+    "cooldown_threshold": 3            # Number of consecutive successes required to reset in "cooldown" mode
 }
-
 
 
 
@@ -205,12 +210,18 @@ def save_state(event_id: str, state: dict):
             logging.error("Error writing DIVA state to DynamoDB", exc_info=True)
 
 
-def _load_event_state(event_name: str, full_state: dict | None = None) -> dict:
-    """Helper: load state for a single event, backend-agnostic."""
+def _load_event_state(event_name: str, full_state: dict | None, warmup_enabled: bool) -> dict:
+    """ Helper: load state for a single event, backend-agnostic.
+        Ensures 'in_warmup' is set according to current configuration if state is new.
+    """
     if DIVA_MODE == "monolithic":
-        return full_state.get(event_name, DEFAULT_EVENT_STATE.copy())
+        new_state = DEFAULT_EVENT_STATE.copy()
+        new_state["in_warmup"] = warmup_enabled
+        return full_state.get(event_name, new_state)
     else:
         state = load_state(event_name)
+        if state == {}:
+            state["in_warmup"] = warmup_enabled
         return {**DEFAULT_EVENT_STATE, **state}
 
 
@@ -222,7 +233,7 @@ def _save_event_state(event_name: str, event_state: dict, full_state: dict | Non
         save_state(event_name, event_state)
 
 
-def _reset_event_state(event_state: dict, reset_config: dict, cooldown_threshold: int):
+def _reset_event_state(event_state: dict, reset_config: dict, warmup_enabled: bool) -> dict:
     """
     Reset or update event state based on reset configuration after a successful detection.
 
@@ -231,24 +242,29 @@ def _reset_event_state(event_state: dict, reset_config: dict, cooldown_threshold
         reset_config: Dict with keys:
             - mode: "fast" or "cooldown"
             - on_verify: bool, reset failures after a verified detection
-        cooldown_threshold: Number of consecutive successes before reset in "cooldown" mode.
+            - cooldown_threshold: Number of consecutive successes before reset in "cooldown" mode.
+        warmup_enabled: Whether warmup is enabled for the event.
 
     Returns:
         dict: Updated event state.
     """
-    mode = reset_config.get("mode", "fast")
-    on_verify = reset_config.get("on_verify", True)
+    mode = reset_config.get("mode")
+    on_verify = reset_config.get("on_verify")
+    cooldown_threshold = reset_config.get("cooldown_threshold")
 
     if not on_verify:
         return event_state
 
     if mode == "fast":
-        return DEFAULT_EVENT_STATE.copy()
+        new_state = DEFAULT_EVENT_STATE.copy()
+        new_state["in_warmup"] = warmup_enabled
+        return new_state
     elif mode == "cooldown":
         event_state["cooldown_counter"] = event_state.get("cooldown_counter", 0) + 1
         if event_state["cooldown_counter"] >= cooldown_threshold:
-            return DEFAULT_EVENT_STATE.copy()
-
+            new_state = DEFAULT_EVENT_STATE.copy()
+            new_state["in_warmup"] = warmup_enabled
+            return new_state
     return event_state
 
 
@@ -271,15 +287,19 @@ def process_detection(event_name, funcs, event_state):
     """
     Run detection logic for an event and update state.
 
-    - Increments detection failure counter on failures.
+    - Increments detection failure counter on failures if not in warmup state.
     - Resets counters on success depending on reset_policy and reset_on_verify.
     - Triggers alert when max_failed_detections is exceeded.
     """
     results = {}
 
     max_failed_detections = funcs.get("max_failed_detections", DEFAULT_MAX_FAILED_DETECTIONS)
+    warmup_config = funcs.get("warmup", DEFAULT_WARMUP)
+    warmup_threshold = warmup_config.get("success_threshold")
     reset_config = funcs.get("reset", DEFAULT_RESET)
-    cooldown_threshold = funcs.get("cooldown_success_threshold", DEFAULT_COOLDOWN_THRESHOLD)
+    reset_mode = reset_config.get("mode")
+    reset_on_verify = reset_config.get("on_verify")
+    cooldown_threshold = reset_config.get("cooldown_success_threshold")
 
     logging.info("Detecting event '%s'...", event_name)
     logging.debug("Detection start | event=%s | state=%s", event_name, event_state)
@@ -287,25 +307,46 @@ def process_detection(event_name, funcs, event_state):
     try:
         detected = funcs["detect"](event_name)
     except Exception as e:
+        if event_state.get("in_warmup"):
+            logging.error("Detection exception in event '%s' during warmup: %s", event_name, e, exc_info=True)
+            logging.debug("Detection error during warmup | event=%s | state=%s", event_name, event_state)
+            results[event_name] = f"detection_error (warmup)"
+            return event_state, results
         event_state["detection_failures"] += 1
         logging.error("Detection exception in event '%s': %s", event_name, e, exc_info=True)
         logging.debug("Detection error | event=%s | state=%s", event_name, event_state)
         results[event_name] = f"detection_error ({event_state['detection_failures']}x/{max_failed_detections})"
         return event_state, results
 
+    # Detection succeeded
     if detected:
+        if event_state.get("in_warmup"):
+            event_state["warmup_counter"] += 1
+            if event_state["warmup_counter"] >= warmup_threshold:
+                event_state["in_warmup"] = False
+                event_state["warmup_counter"] = 0
+                logging.info("Event '%s' exited warmup after %d consecutive successes", event_name, warmup_threshold)
+            else:
+                logging.info(
+                    "Detection for event '%s' succeeded '%d'x in warmup (need %d)",
+                    event_name, event_state["warmup_counter"], warmup_threshold
+                )
+                results[event_name] = f"warmup_success ({event_state['warmup_counter']}/{warmup_threshold})"
+                logging.debug("Detection success during warmup | event=%s | state=%s", event_name, event_state)
+                return event_state, results
+
+        # Detected successfully and not in warmup → reset failure counter
         logging.info("Detection for event '%s' succeeded", event_name)
-        # Reset state according to policy
         old_state = event_state.copy()
 
         # Reset state if on_verify is True
-        if reset_config.get("on_verify", True):
-            event_state = _reset_event_state(event_state, reset_config, cooldown_threshold)
+        if reset_on_verify:
+            event_state = _reset_event_state(event_state, reset_config, warmup_config.get("enabled"))
 
         # Cooldown / fast reset logging
-        if reset_config.get("mode", "fast") == "fast" and reset_config.get("on_verify", True):
+        if reset_mode == "fast" and reset_on_verify:
             logging.debug("Fast reset applied | before=%s | after=%s", old_state, event_state)
-        elif reset_config.get("mode") == "cooldown" and event_state.get("alerted", False) and reset_config.get("on_verify", True):
+        elif reset_mode == "cooldown" and event_state.get("alerted", False) and reset_on_verify:
             cc = event_state.get("cooldown_counter", 0)
             if cc < cooldown_threshold:
                 logging.info("Event '%s' in cooldown (%d/%d)", event_name, cc, cooldown_threshold)
@@ -316,7 +357,18 @@ def process_detection(event_name, funcs, event_state):
         results[event_name] = "ok"
         return event_state, results
 
-    # Detection failed → increment counter
+    # Detection failed → reset warmup counter if in warmup
+    if event_state.get("in_warmup"):
+        logging.info(
+            "Detection for event '%s' failed in warmup",
+            event_name
+        )
+        event_state["warmup_counter"] = 0
+        results[event_name] = f"failed_detection (warmup)"
+        logging.debug("Detection fail during warmup | event=%s | state=%s", event_name, event_state)
+        return event_state, results
+
+    # Not detected and not in warmup → count failure
     event_state["detection_failures"] += 1
     failures = event_state["detection_failures"]
 
@@ -348,12 +400,15 @@ def should_inject(event_state, funcs):
     Returns:
         (bool, str): Whether to inject, and status string for reporting.
     """
+    if event_state.get("in_warmup") and event_state.get("warmup_counter") == 0:
+        return True, "injecting (warmup)"
+
     failures = event_state.get("detection_failures", 0)
 
     if failures == 0:
         return False, "skipped (healthy)"
 
-    if failures == 1 or funcs.get("inject_each_period", DEFAULT_INJECT_EACH_PERIOD):
+    if (failures == 1 and event_state.get("injected") == False) or funcs.get("inject_each_period", DEFAULT_INJECT_EACH_PERIOD):
         return True, "injected"
 
     return False, f"waiting ({failures}x)"
@@ -490,7 +545,8 @@ def process_events_serial(events: dict, full_state: dict | None = None):
     results = {}
 
     for event_name, funcs in events.items():
-        event_state = _load_event_state(event_name, full_state)
+        warmup_enabled = funcs.get("warmup", DEFAULT_WARMUP).get("enabled")
+        event_state = _load_event_state(event_name, full_state, warmup_enabled)
         _, event_result = process_event(event_name, funcs, event_state)
         _save_event_state(event_name, event_state, full_state)
         results.update(event_result)
@@ -506,7 +562,8 @@ def process_events_parallel(events: dict, full_state: dict | None = None):
     results = {}
 
     def _process_single(event_name: str, funcs: dict):
-        event_state = _load_event_state(event_name, full_state)
+        warmup_enabled = funcs.get("warmup", DEFAULT_WARMUP).get("enabled")
+        event_state = _load_event_state(event_name, full_state, warmup_enabled)
         event_state, event_result = process_event(event_name, funcs, event_state)
         _save_event_state(event_name, event_state, full_state)
         return event_result

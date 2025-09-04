@@ -49,16 +49,23 @@ DIVA runs periodically (via CloudWatch schedule), iterating through all events:
    - Only performed if needed (on first failure or if configured to reinject each period).  
    - Injection failures increment a separate counter.  
 
-3. **Alerting**  
+3. **Warmup Handling**  
+  - Events can enter a configurable "warmup" period before failures are counted.  
+  - During warmup, failures are tracked but not treated as alerts.  
+  - Warmup completes after either:  
+    - A fixed number of periods, or  
+    - The first successful detection (depending on configuration).  
+
+4. **Alerting**  
    - Triggered once one or more max thresholds are reached:  
      - `max_failed_detections` → alert for repeated detection failures  
      - `max_failed_injections` → alert for repeated injection failures  
 
-4. **State persistence**  
+5. **State persistence**  
    - Monolithic mode → persisted to **S3** JSON object.  
    - Distributed mode → persisted per-event to **DynamoDB**.  
 
-5. **Recovery / Reset**  
+6. **Recovery / Reset**  
    - If an event is successfully detected, state may reset according to `reset_policy`:  
      - `"fast"` → reset failures and injection flags immediately  
      - `"cooldown"` → increment a `cooldown_counter` each successful detection until a threshold is reached, then reset  
@@ -72,32 +79,52 @@ Each event has a state object that tracks minimal but essential information:
 
 | Field                  | Description                                                                 |
 |------------------------|-----------------------------------------------------------------------------|
-| `detection_failures`    | Consecutive failed detections.                                              |
-| `injection_failures`    | Consecutive failed injections.                                              |
-| `injected`              | Whether the event has been successfully injected.                          |
-| `alerted`               | Whether an alert has been generated for this event.                        |
-| `cooldown_counter`      | Counts consecutive successful detections after an alert in "cooldown" mode.|
+| `detection_failures`   | Consecutive failed detections.                                              |
+| `injection_failures`   | Consecutive failed injections.                                              |
+| `injected`             | Whether the event has been successfully injected.                          |
+| `alerted`              | Whether an alert has been generated for this event.                        |
+| `cooldown_counter`     | Counts consecutive successful detections after an alert in "cooldown" mode.|
+| `warmup_counter`       | Number of periods elapsed in warmup mode.                                  |
+| `warmup_completed`     | Whether warmup has ended and real failures should be counted.               |
 
 - State is persisted to **S3** in monolithic mode and **DynamoDB** in distributed mode.
-- On a successful detection, the state may be reset according to `reset_policy`:
+- On a successful detection, the state may be reset according to `reset` configuration:
   - `"fast"`: Immediately resets the state to defaults.
   - `"cooldown"`: Increments `cooldown_counter` and resets only after `cooldown_success_threshold` consecutive successful detections.
-- CloudWatch logging provides a complete chronological record of detections and injections.
+- `warmup` can delay failure counting either for a fixed number of periods or until the first successful detection (whichever is configured).
+- CloudWatch logging provides a complete chronological record of detections, injections, warmup transitions, and resets.
 
 ---
 
 ## Reset Policies
 
-`reset_policy` determines how the event state is updated after successful detection:
+`reset` determines how the event state is updated after successful detection:
 
-| Policy    | Description                                                                                  |
-|-----------|----------------------------------------------------------------------------------------------|
-| `fast`    | Immediately resets the event state to default values.                                         |
-| `cooldown`| Increments `cooldown_counter` on each successful detection. State is reset only after the counter reaches `cooldown_success_threshold`. |
+| Key       | Type    | Description                                                                                          |
+|-----------|---------|------------------------------------------------------------------------------------------------------|
+| `mode`    | String  | `"fast"` = immediate reset, `"cooldown"` = reset after threshold of successful detections.            |
+| `on_verify` | Bool  | If `true`, automatically reset failure counts/alert state after a successful verification injection. |
+| `cooldown_success_threshold` | Integer | Number of consecutive successful detections required before cooldown resets.    |
 
-- Default policy: `fast`.
+- Default mode: `"fast"`.
 - `cooldown_success_threshold` (default: 3) specifies how many consecutive successful detections are required before state reset in cooldown mode.
 - Alerts and failure counters are cleared when state is reset.
+
+---
+
+## Warmup
+
+The `warmup` object delays failure counting until the system stabilizes:
+
+| Key         | Type    | Description                                                                                     |
+|-------------|---------|-------------------------------------------------------------------------------------------------|
+| `periods`   | Integer | Number of initial monitoring periods to skip counting failures.                                 |
+| `until_first_success` | Bool | If `true`, failures are ignored until the first successful detection is observed.        |
+
+- Either or both options may be set.  
+- Warmup ends once its conditions are satisfied, after which failures are tracked normally.  
+- During warmup, events are reported as `"waiting (N×)"` instead of `"failed"`. 
+
 
 ---
 
@@ -130,6 +157,26 @@ Each event has a state object that tracks minimal but essential information:
 
 ---
 
+# DIVA `event_logic.py` — Events Map Options
+
+| Option                   | Type     | Required | Description                                                                 | Example | Default |
+|--------------------------|----------|----------|-----------------------------------------------------------------------------|---------|---------|
+| `detect`                 | Callable | ✅ Yes if role is 'detect' or 'both'   | Function that checks if the event has occurred. Should return `True/False`. | `lambda _: detect_bus_activity('chain-level-0-bus-0')` | N/A |
+| `inject`                 | Callable | ✅ Yes if role is 'inject' or 'both'    | Function that injects/triggers the event into the system.                   | `lambda event_name: inject_to_bus(event_name, 'chain-level-0-bus-0')` | Omitted |
+| `alert`                  | Callable | ✅ Yes   | Callback invoked when detection is triggered.                               | `alert` | N/A |
+| `reset.mode`             | String   | ❌ No    | Reset policy after successful detection.<br>• `"fast"` = immediate reset<br>• `"cooldown"` = reset after threshold of successful detections | `"cooldown"` | `"fast"` |
+| `reset.on_verify`        | Boolean  | ❌ No    | If `true`, automatically reset failure counts / alert state after successful verification. | `{'on_verify': False}` | `True` |
+| `reset.cooldown_success_threshold` | Integer | ❌ No | Number of consecutive successful detections required before cooldown resets. | `2` | `3` |
+| `warmup.periods`         | Integer  | ❌ No    | Number of periods to skip failure counting.                                | `2` | `0` |
+| `warmup.until_first_success` | Boolean | ❌ No | If true, failures are ignored until the first successful detection.        | `True` | `False` |
+| `role`                   | String   | ❌ No    | Defines how DIVA should treat an event.<br>• detect, inject, both  | `"detect"` | `"both"` |
+| `max_failed_injections`  | Integer  | ❌ No    | Maximum number of failed injection attempts before stopping further attempts. | `3` | `1` |
+| `max_failed_detections`  | Integer  | ❌ No    | Maximum number of failed detections before stopping further checks.         | `5` | `3` |
+| `inject_each_period`     | Boolean  | ❌ No    | If `true`, injection will be attempted in every monitoring period instead of once. | `True` | `False` |
+
+---
+
+
 ## Example `event_logic.py`
 
 You must provide this file alongside the Terraform module.
@@ -145,7 +192,10 @@ def get_events():
             "max_failed_detections": 3,     # alert after 3 failed detections
             "max_failed_injections": 1,     # alert after 1 failed injection
             "inject_each_period": True,     # inject on every period if failed
-            "reset_policy": "cooldown",     # cooldown reset after success
+            "reset": {
+                "mode": "cooldown",         # use cooldown reset policy
+                "on_verify": False          # do not reset on successful verification
+            }
             "cooldown_success_threshold": 2 # reset after 2 consecutive successful detections
         },
         "event_2": {
@@ -279,17 +329,18 @@ module "diva_distributed" {
 
 ## Example Logs
 ```text
-INFO  Getting events...  
-INFO  Retrieved 4 events  
-INFO  Detecting event 'event_1'...  
-INFO  Detection for event 'event_1' failed (1/3)  
-INFO  Injecting event 'event_1'...  
-INFO  Detection for event 'event_2' skipped due to role='inject'  
-INFO  Injecting event 'event_2'...  
-INFO  Detection for event 'event_3' succeeded  
-INFO  Event 'event_3' cooldown complete → state fully reset  
-INFO  Alerting for event 'event_1'  
-INFO  Event 'event_1' alerted  
+INFO  Getting events...
+INFO  Retrieved 4 events
+INFO  Detecting event 'event_1'...
+INFO  Detection for event 'event_1' failed (1/3)
+INFO  Injecting event 'event_1'...
+INFO  Detection for event 'event_2' skipped due to role='inject'
+INFO  Injecting event 'event_2'...
+INFO  Detection for event 'event_3' succeeded
+INFO  Event 'event_3' cooldown complete → state fully reset
+INFO  Event 'event_1' still in warmup (waiting 2/2)
+INFO  Alerting for event 'event_1'
+INFO  Event 'event_1' alerted
 ```
 Successful events, skipped detections, injections, cooldowns, and alerts are all clearly logged.  
 
