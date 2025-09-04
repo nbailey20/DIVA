@@ -161,8 +161,8 @@ The `warmup` object delays failure counting until the system stabilizes:
 
 | Option                   | Type     | Required | Description                                                                 | Example | Default |
 |--------------------------|----------|----------|-----------------------------------------------------------------------------|---------|---------|
-| `detect`                 | Callable | ✅ Yes if role is 'detect' or 'both'   | Function that checks if the event has occurred. Should return `True/False`. | `lambda _: detect_bus_activity('chain-level-0-bus-0')` | N/A |
-| `inject`                 | Callable | ✅ Yes if role is 'inject' or 'both'    | Function that injects/triggers the event into the system.                   | `lambda event_name: inject_to_bus(event_name, 'chain-level-0-bus-0')` | Omitted |
+| `detect`                 | Callable | ✅ Yes if role is 'detect' or 'both'   | Function that checks if the event has occurred. Should return `True/False`. | `detect` | N/A |
+| `inject`                 | Callable | ✅ Yes if role is 'inject' or 'both'    | Function that injects/triggers the event into the system.                   | `inject` | Omitted |
 | `alert`                  | Callable | ✅ Yes   | Callback invoked when detection is triggered.                               | `alert` | N/A |
 | `reset.mode`             | String   | ❌ No    | Reset policy after successful detection.<br>• `"fast"` = immediate reset<br>• `"cooldown"` = reset after threshold of successful detections | `"cooldown"` | `"fast"` |
 | `reset.on_verify`        | Boolean  | ❌ No    | If `true`, automatically reset failure counts / alert state after successful verification. | `{'on_verify': False}` | `True` |
