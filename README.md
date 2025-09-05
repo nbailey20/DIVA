@@ -90,7 +90,7 @@ Each event has a state object that tracks minimal but essential information:
 - State is persisted to **S3** in monolithic mode and **DynamoDB** in distributed mode.
 - On a successful detection, the state may be reset according to `reset` configuration:
   - `"fast"`: Immediately resets the state to defaults.
-  - `"cooldown"`: Increments `cooldown_counter` and resets only after `cooldown_success_threshold` consecutive successful detections.
+  - `"cooldown"`: Increments `cooldown_counter` and resets only after `success_threshold` consecutive successful detections.
 - `warmup` can delay failure counting either for a fixed number of periods or until the first successful detection (whichever is configured).
 - CloudWatch logging provides a complete chronological record of detections, injections, warmup transitions, and resets.
 
@@ -102,12 +102,11 @@ Each event has a state object that tracks minimal but essential information:
 
 | Key       | Type    | Description                                                                                          |
 |-----------|---------|------------------------------------------------------------------------------------------------------|
-| `mode`    | String  | `"fast"` = immediate reset, `"cooldown"` = reset after threshold of successful detections.            |
-| `on_verify` | Bool  | If `true`, automatically reset failure counts/alert state after a successful verification injection. |
-| `cooldown_success_threshold` | Integer | Number of consecutive successful detections required before cooldown resets.    |
+| `mode`    | string  | `"fast"` = immediate reset, `"cooldown"` = reset after threshold of successful detections.            |
+| `success_threshold` | Integer | Number of consecutive successful detections required before cooldown resets.    |
 
 - Default mode: `"fast"`.
-- `cooldown_success_threshold` (default: 3) specifies how many consecutive successful detections are required before state reset in cooldown mode.
+- `success_threshold` (default: 3) specifies how many consecutive successful detections are required before state reset in cooldown mode.
 - Alerts and failure counters are cleared when state is reset.
 
 ---
@@ -118,8 +117,8 @@ The `warmup` object delays failure counting until the system stabilizes:
 
 | Key         | Type    | Description                                                                                     |
 |-------------|---------|-------------------------------------------------------------------------------------------------|
-| `periods`   | Integer | Number of initial monitoring periods to skip counting failures.                                 |
-| `until_first_success` | Bool | If `true`, failures are ignored until the first successful detection is observed.        |
+| `enabled`   | bool | Whether warmup is enabled or not.                                 |
+| `success_threshold` | int | Failures are ignored until this many successful detections are observed.        |
 
 - Either or both options may be set.  
 - Warmup ends once its conditions are satisfied, after which failures are tracked normally.  
@@ -165,8 +164,7 @@ The `warmup` object delays failure counting until the system stabilizes:
 | `inject`                 | Callable | ✅ Yes if role is 'inject' or 'both'    | Function that injects/triggers the event into the system.                   | `inject` | Omitted |
 | `alert`                  | Callable | ✅ Yes   | Callback invoked when detection is triggered.                               | `alert` | N/A |
 | `reset.mode`             | String   | ❌ No    | Reset policy after successful detection.<br>• `"fast"` = immediate reset<br>• `"cooldown"` = reset after threshold of successful detections | `"cooldown"` | `"fast"` |
-| `reset.on_verify`        | Boolean  | ❌ No    | If `true`, automatically reset failure counts / alert state after successful verification. | `{'on_verify': False}` | `True` |
-| `reset.cooldown_success_threshold` | Integer | ❌ No | Number of consecutive successful detections required before cooldown resets. | `2` | `3` |
+| `reset.success_threshold` | Integer | ❌ No | Number of consecutive successful detections required before cooldown resets. | `2` | `3` |
 | `warmup.periods`         | Integer  | ❌ No    | Number of periods to skip failure counting.                                | `2` | `0` |
 | `warmup.until_first_success` | Boolean | ❌ No | If true, failures are ignored until the first successful detection.        | `True` | `False` |
 | `role`                   | String   | ❌ No    | Defines how DIVA should treat an event.<br>• detect, inject, both  | `"detect"` | `"both"` |
@@ -194,9 +192,8 @@ def get_events():
             "inject_each_period": True,     # inject on every period if failed
             "reset": {
                 "mode": "cooldown",         # use cooldown reset policy
-                "on_verify": False          # do not reset on successful verification
             }
-            "cooldown_success_threshold": 2 # reset after 2 consecutive successful detections
+            "success_threshold": 2 # reset after 2 consecutive successful detections
         },
         "event_2": {
             "inject": inject_sample,

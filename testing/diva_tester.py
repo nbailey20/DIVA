@@ -1,16 +1,22 @@
 import argparse
 import json
+import io
+import zipfile
+from time import sleep
 import boto3
 
-client = boto3.client("events")
+
+lambda_client = boto3.client("lambda")
 iam = boto3.client("iam")
+sts = boto3.client("sts")
+account_id = sts.get_caller_identity()["Account"]
+region = boto3.session.Session().region_name
 
-IAM_ROLE_NAME = "EventBridgeCrossBusRole"
-
+IAM_ROLE_NAME = "LambdaInvokeRole"
 
 def create_iam_role():
     """
-    Creates an IAM role that allows EventBridge to put events on other buses.
+    Creates an IAM role that allows a Lambda function to invoke other functions.
     """
     role_name = IAM_ROLE_NAME
     assume_policy = {
@@ -18,7 +24,7 @@ def create_iam_role():
         "Statement": [
             {
                 "Effect": "Allow",
-                "Principal": {"Service": "events.amazonaws.com"},
+                "Principal": {"Service": "lambda.amazonaws.com"},
                 "Action": "sts:AssumeRole"
             }
         ]
@@ -39,7 +45,12 @@ def create_iam_role():
             "Statement": [
                 {
                     "Effect": "Allow",
-                    "Action": "events:PutEvents",
+                    "Action": "lambda:InvokeFunction",
+                    "Resource": "*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": "logs:*",
                     "Resource": "*"
                 }
             ]
@@ -65,84 +76,117 @@ def delete_iam_role():
     print("🗑️  IAM role deleted successfully")
 
 
-def create_chain(chain_spec, role_arn):
-    """
-    Creates a chain of EventBridge buses according to chain_spec.
-    Example: [2,3,1,1] => (A,A)->(B,B,B)->C->D
-    """
-    buses_by_level = []
-    
-    for i, count in enumerate(chain_spec):
-        level_buses = []
-        for j in range(count):
-            bus_name = f"chain-level-{i}-bus-{j}"
-            print(f"Creating bus: {bus_name}")
-            client.create_event_bus(Name=bus_name)
-            level_buses.append(bus_name)
-        buses_by_level.append(level_buses)
+# Simple Lambda function code template
+LAMBDA_CODE = """
+import os
+import boto3
 
-    # Connect buses by rules
-    for i in range(len(buses_by_level) - 1):
-        for src_bus in buses_by_level[i]:
-            for dst_bus in buses_by_level[i+1]:
-                rule_name = f"{src_bus}-to-{dst_bus}"
-                print(f"Creating rule {rule_name} from {src_bus} -> {dst_bus}")
-                client.put_rule(
-                    Name=rule_name,
-                    EventBusName=src_bus,
-                    EventPattern=json.dumps({"source": ["*"]})  # match all events
+lambda_client = boto3.client("lambda")
+
+def lambda_handler(event, context):
+    children = os.environ.get("CHILD_LAMBDAS", "").split(",")
+    for child in children:
+        if child:
+            lambda_client.invoke(FunctionName=child, InvocationType="Event")
+            print(f"Invoked {child}")
+    return {"status": "ok", "invoked_children": children}
+"""
+
+def create_zip_from_code(code_str):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("lambda_function.py", code_str)
+    buf.seek(0)
+    return buf.read()
+
+
+def create_lambda_chain(chain_spec, role_arn, base_name="node"):
+    """
+    Create a fan-out Lambda chain where each function knows the ARNs of its children.
+
+    Args:
+        chain_spec (list[int]): Number of lambdas at each level, e.g., [1, 2, 1]
+        role_arn (str): IAM role ARN for all lambdas
+        base_name (str): Base name for lambda functions
+
+    Returns:
+        list[str]: All Lambda ARNs in the chain
+    """
+    lambdas_by_level = []
+    all_lambdas = []
+    zip_bytes = create_zip_from_code(LAMBDA_CODE)
+
+    # Precompute "names" for all lambdas at each level so we can construct ARNs
+    lambda_names_by_level = []
+    for level_idx, count in enumerate(chain_spec):
+        level_names = [f"{base_name}-{level_idx}-{node_idx}" for node_idx in range(count)]
+        lambda_names_by_level.append(level_names)
+
+    # Now create all functions in order
+    for level_idx, count in enumerate(chain_spec):
+        level_lambdas = []
+        for node_idx in range(count):
+            lambda_name = lambda_names_by_level[level_idx][node_idx]
+
+            # Compute children ARNs for next level (empty for last level)
+            if level_idx + 1 < len(chain_spec):
+                next_level_names = lambda_names_by_level[level_idx + 1]
+                children_str = ",".join(
+                    f"arn:aws:lambda:{lambda_client.meta.region_name}:"
+                    f"{boto3.client('sts').get_caller_identity()['Account']}:function:{name}:$LATEST"
+                    for name in next_level_names
                 )
-                client.put_targets(
-                    Rule=rule_name,
-                    EventBusName=src_bus,
-                    Targets=[
-                        {
-                            "Id": dst_bus,
-                            "Arn": f"arn:aws:events:{client.meta.region_name}:{boto3.client('sts').get_caller_identity()['Account']}:event-bus/{dst_bus}",
-                            "RoleArn": role_arn
-                        }
-                    ]
-                )
+            else:
+                children_str = ""
 
-    print("✅ Chain created successfully")
-    return buses_by_level
+            response = lambda_client.create_function(
+                FunctionName=lambda_name,
+                Runtime="python3.13",
+                Role=role_arn,
+                Handler="lambda_function.lambda_handler",
+                Code={"ZipFile": zip_bytes},
+                Timeout=60,
+                MemorySize=128,
+                Environment={"Variables": {"CHILD_LAMBDAS": children_str}}
+            )
+
+            lambda_arn = response["FunctionArn"]
+            level_lambdas.append(lambda_arn)
+            all_lambdas.append(lambda_arn)
+            print(f"✅ Created Lambda: {lambda_name} with children: {children_str.split(',') if children_str else '[]'}")
+
+        lambdas_by_level.append(level_lambdas)
+
+    print("✅ Lambda chain created successfully")
+    return all_lambdas
 
 
-def delete_chain(chain_spec):
+
+def delete_lambda_chain(chain_spec, base_name="node"):
     """
-    Deletes all buses and rules created for the chain.
+    Delete all Lambda functions created by create_lambda_chain.
+
+    Args:
+        chain_spec (list[int]): Number of Lambdas per level, e.g., [1,2,1].
+        base_name (str): Base name used in create_lambda_chain (default "node").
     """
-    buses_by_level = []
-    for i, count in enumerate(chain_spec):
-        buses_by_level.append([f"chain-level-{i}-bus-{j}" for j in range(count)])
+    lambda_client = boto3.client("lambda")
 
-    # Delete rules and targets
-    for i in range(len(buses_by_level) - 1):
-        for src_bus in buses_by_level[i]:
-            for dst_bus in buses_by_level[i+1]:
-                rule_name = f"{src_bus}-to-{dst_bus}"
-                print(f"Deleting rule {rule_name}")
-                try:
-                    client.remove_targets(Rule=rule_name, EventBusName=src_bus, Ids=[dst_bus])
-                except client.exceptions.ResourceNotFoundException:
-                    pass
-                try:
-                    client.delete_rule(Name=rule_name, EventBusName=src_bus)
-                except client.exceptions.ResourceNotFoundException:
-                    pass
-
-    # Delete buses
-    for level in reversed(buses_by_level):
-        for bus in level:
-            print(f"Deleting bus {bus}")
+    for level_idx, count in enumerate(chain_spec):
+        for node_idx in range(count):
+            lambda_name = f"{base_name}-{level_idx}-{node_idx}"
             try:
-                client.delete_event_bus(Name=bus)
-            except client.exceptions.ResourceNotFoundException:
-                pass
-
+                lambda_client.delete_function(FunctionName=lambda_name)
+                print(f"✅ Deleted Lambda: {lambda_name}")
+            except lambda_client.exceptions.ResourceNotFoundException:
+                print(f"⚠️ Lambda not found (already deleted?): {lambda_name}")
+            except Exception as e:
+                print(f"❌ Failed to delete Lambda {lambda_name}: {e}")
     print("🗑️  Chain deleted successfully")
 
 
+
+# -------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build or delete EventBridge bus chains")
     parser.add_argument("chain", help="Comma-separated list of ints (e.g. 2,3,1,1)")
@@ -152,8 +196,10 @@ if __name__ == "__main__":
     chain_spec = [int(x) for x in args.chain.split(",")]
 
     if args.delete:
-        delete_chain(chain_spec)
+        delete_lambda_chain(chain_spec)
         delete_iam_role()
     else:
         role_arn = create_iam_role()
-        create_chain(chain_spec, role_arn)
+        print("Waiting 10 seconds for IAM role to propagate...")
+        sleep(10)  # Wait for IAM role to propagate
+        create_lambda_chain(chain_spec, role_arn)

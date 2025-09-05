@@ -56,7 +56,6 @@ class WarmupConfig:
 @dataclass
 class ResetConfig:
     mode: str = "fast"                # "fast" | "cooldown"
-    on_verify: bool = True            # reset only after a successful detection
     cooldown_threshold: int = 3       # consecutive successes required to reset when in cooldown
 
 # --- event state --------------------------------------------------------------
@@ -208,8 +207,7 @@ class DivaEvent:
 
         self.reset = ResetConfig(
             mode = reset_cfg_raw.get("mode", "fast"),
-            on_verify = bool(reset_cfg_raw.get("on_verify", True)),
-            cooldown_threshold = int(reset_cfg_raw.get("cooldown_threshold", reset_cfg_raw.get("cooldown_success_threshold", 3))),
+            cooldown_threshold = int(reset_cfg_raw.get("cooldown_threshold", reset_cfg_raw.get("success_threshold", 3))),
         )
 
         self.role = Role(funcs.get("role", DEFAULT_DIVA_ROLE))
@@ -336,21 +334,24 @@ class DivaEvent:
                         f"{self.state.warmup_counter}x in warmup (need {self.warmup.success_threshold})")
 
         # Post-success reset behavior
-        if self.reset.on_verify:
-            if self.reset.mode == "fast":
-                # full reset but preserve warmup flag if enabled in config
-                keep_warmup = self.warmup.enabled
-                new_state = EventState(in_warmup=keep_warmup)
-                self.state = new_state
-                return None
-            elif self.reset.mode == "cooldown" and self.state.alerted:
-                self.state.cooldown_counter += 1
-                if self.state.cooldown_counter < self.reset.cooldown_threshold:
-                    return f"Event '{self.name}' in cooldown ({self.state.cooldown_counter}/{self.reset.cooldown_threshold})"
-                # cooldown complete → full reset
-                keep_warmup = self.warmup.enabled
-                self.state = EventState(in_warmup=keep_warmup)
-                return f"Event '{self.name}' cooldown complete → state fully reset"
+        if not self.state.alerted:
+            # quick reset if not alerted
+            new_state = EventState(in_warmup=False)
+            self.state = new_state
+            return None
+        elif self.reset.mode == "fast":
+            # if alert generated, apply cooldown and warmup settings along with reset
+            new_state = EventState(in_warmup=self.warmup.enabled)
+            self.state = new_state
+            return f"Event '{self.name}' reset after successful detection (mode=fast)"
+        elif self.reset.mode == "cooldown":
+            self.state.cooldown_counter += 1
+            if self.state.cooldown_counter < self.reset.cooldown_threshold:
+                return f"Event '{self.name}' in cooldown ({self.state.cooldown_counter}/{self.reset.cooldown_threshold})"
+            # cooldown complete → full reset
+            keep_warmup = self.warmup.enabled
+            self.state = EventState(in_warmup=keep_warmup)
+            return f"Event '{self.name}' cooldown complete → state fully reset"
         return None
 
     def check_alert(self) -> Optional[str]:
@@ -484,7 +485,7 @@ class DivaEngine:
                 try:
                     name, res, new_state = fut.result()
                     results.update(res)
-                    _ = self._save_event_state(name, new_state, full_state)
+                    full_state = self._save_event_state(name, new_state, full_state)
                 except Exception as e:
                     logging.error("Error processing event '%s': %s", futures[fut], e, exc_info=True)
 
@@ -508,7 +509,7 @@ class DivaEngine:
             else:
                 logging.debug("Serializing events")
                 results, new_state = self.process_serial(events, full_state)
-            logging.debug("Saving state to S3")
+            logging.debug("Saving state to S3: %s", json.dumps(new_state, indent=2))
             self.backend.save_all(new_state or {})
             logging.info("Saved event state for %d events", len(new_state or {}))
         else:
