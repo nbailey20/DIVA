@@ -42,6 +42,8 @@ python build_diva_events.py 1,2,1
 This will output the event logic text for the specified chain structure.  
 Replace the existing `events` dictionary in `event_logic.py` with the output from this script.
 
+See also sample_event_logic.py in ./diva for a minimal example of event logic for reference.
+
 
 3. Deploy the DIVA module using Terraform to set up DIVA and monitor the Lambda function chain.
 
