@@ -16,16 +16,17 @@ This directory contains a simple test environment for the DIVA (Detect, Inject, 
 python diva_tester.py 1,2,1
 ```
 This example creates a chain of 3 Lambda functions with the following structure:
-    
-  A  
-  |  
-+---+  
-|   |  
-B1  B2  
-|   |  
-+---+  
-  |  
-  C  
+```
+  A
+  |
++---+
+|   |
+B1  B2
+|   |
++---+
+  |
+  C
+```
 
 In this test environment, level N Lambdas will trigger all level N+1 Lambdas.
 E.g. A triggers B1 and B2, and both B1 and B2 trigger C.
