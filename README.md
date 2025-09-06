@@ -1,3 +1,6 @@
+![alt text](image.png)
+
+
 # DIVA Lambda Engine
 
 DIVA (Detect->Inject->Verify->Alert) is an AWS Lambda-based monitoring engine that validates whether **events** can occur in a system.  
