@@ -4,12 +4,6 @@ variable "diva_mode" {
   default     = "monolithic"
 }
 
-variable "region" {
-  description = "AWS region"
-  type        = string
-  default     = "us-east-1"
-}
-
 variable "lambda_name" {
   type        = string
   description = "Name of the DIVA Lambda function"
